@@ -1,0 +1,223 @@
+<?php
+/**
+ * The Twilio module provides a set of helper functions for SMS interaction using the Twilio library
+ */
+
+function twilio_menu() {
+  $items['admin/settings/twilio'] = array(
+    'title' => t('Twilio Settings'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('twilio_settings'),
+    'access arguments' => array('administer site configuration'),
+    'description' => 'Settings for the Twilio SMS interaction',
+    'type' => MENU_LOCAL_TASK,
+  );
+  $items['admin/settings/twilio/log'] = array(
+    'title' => t('Twilio Log'),
+    'page callback' => 'twilio_admin_log',
+    'access arguments' => array('administer site configuration'),
+    'description' => 'Twilio SMS Log',
+    'type' => MENU_LOCAL_TASK,
+  );
+  $items['twilio_sms_url'] = array(
+    'title' => t('Twilio Gateway'),
+    'page callback' => 'twilio_sms_gateway',
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+  );
+  $items['twilio_test_invoke'] = array(
+    'title' => t('Twilio Test Invoke'),
+    'page callback' => 'twilio_test_invoke',
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+function twilio_settings() {
+  $form['twilio_account_sid'] = array(
+    '#type' => 'textfield',
+    '#title' => t("Twilio Account SID"),
+    '#default_value' => variable_get('twilio_account_sid', NULL),
+    '#size' => 34,
+    '#maxlength' => 34,
+    '#description' => t("Account SID under the Developer Tools section"),
+  );
+  $form['twilio_auth_token'] = array(
+    '#type' => 'textfield',
+    '#title' => t("Twilio Auth Token"),
+    '#default_value' => variable_get('twilio_auth_token', NULL),
+    '#size' => 32,
+    '#maxlength' => 32,
+    '#description' => t("Auth Token under the Developer Tools section"),
+  );
+  $form['twilio_phone_number'] = array(
+    '#type' => 'textfield',
+    '#title' => t("Twilio Phone Number"),
+    '#default_value' => variable_get('twilio_phone_number', NULL),
+    '#size' => 16,
+    '#maxlength' => 16,
+    '#description' => t("Phone number registered with Twilio to send and receive SMS messages"),
+  );
+  $form['twilio_welcome_text'] = array(
+    '#type' => 'textfield',
+    '#title' => t("Twilio Welcome Text"),
+    '#default_value' => variable_get('twilio_welcome_text', NULL),
+    '#size' => 100,
+    '#maxlength' => 160,
+    '#description' => t("Message at first contact with a new phone number"),
+  );
+  $form['twilio_help_text'] = array(
+    '#type' => 'textfield',
+    '#title' => t("Twilio Help Text"),
+    '#default_value' => variable_get('twilio_help_text', NULL),
+    '#size' => 100,
+    '#maxlength' => 160,
+    '#description' => t("Message returned when user texts word 'Help' to the twilio number"),
+  );
+  $form['twilio_stop_text'] = array(
+    '#type' => 'textfield',
+    '#title' => t("Twilio Stop Text"),
+    '#default_value' => variable_get('twilio_stop_text', NULL),
+    '#size' => 100,
+    '#maxlength' => 160,
+    '#description' => t("Message returned when user texts word 'Stop' to the twilio number"),
+  );
+
+  return system_settings_form($form);
+}
+
+function twilio_settings_validate($form, &$form_state) {
+  $form_state['values']['twilio_phone_number'] = preg_replace('/[^0-9]/', '', $form_state['values']['twilio_phone_number']);
+  if (strlen($form_state['values']['twilio_phone_number']) < 11) {
+    $form_state['values']['twilio_phone_number'] = str_pad($form_state['values']['twilio_phone_number'], 11, '1', STR_PAD_LEFT);
+  }
+}
+
+function twilio_admin_log() {
+  $rows = array();
+
+  $res = db_query("SELECT * FROM twilio_log ORDER BY tid DESC");
+  while ($row = db_fetch_array($res)) {
+    $row['timestamp'] = date("F j, Y, g:i a", $row['timestamp']);
+    $rows[] = $row;
+  }
+  $content .= theme('table', array_keys($rows[0]), $rows);
+
+  return $content;
+}
+
+function twilio_send_message($to_number, $message) {
+  require_once(drupal_get_path('module', 'twilio') . '/library/twilio.php');
+  $twilio_account_sid = variable_get('twilio_account_sid', NULL);
+  $twilio_auth_token = variable_get('twilio_auth_token', NULL);
+  $twilio_phone_number = variable_get('twilio_phone_number', NULL);
+
+  $tclient = new TwilioRestClient($twilio_account_sid, $twilio_auth_token);
+
+  // split message into chunks if needed
+  $message_chunks = str_split($message, 160);
+
+  foreach($message_chunks as $chunk) {
+    $response = $tclient->request(
+      "/2010-04-01/Accounts/$twilio_account_sid/SMS/Messages",
+      "POST",
+      array("To" => $to_number,
+            "From" => $twilio_phone_number,
+            "Body" => $chunk)
+    );
+    if ($response->IsError) {
+      $errors[] = $response->ErrorMessage;
+    }
+    else {
+      // log the message
+      twilio_log_message(array('uid' => twilio_lookup_user($to_number),
+                               'text' => $chunk,
+                               'phone' => $to_number,
+                               'incoming' => 0));
+    }
+  }
+
+  if (count($errors)) {
+    return "Error Status: " . implode(', ', $errors);
+  }
+  else {
+    return 0;
+  }
+}
+
+function twilio_sms_gateway() {
+  // capture incoming text information (only from Twilio)
+  $twilio_account_sid = variable_get('twilio_account_sid', NULL);
+  if ($twilio_account_sid && ($_REQUEST['AccountSid'] == $twilio_account_sid)) {
+    $responses = array();
+
+    $incoming = array('text' => trim($_REQUEST['Body']),
+                      'phone' => preg_replace('/[^0-9]/', '', $_REQUEST['From']),
+                      'incoming' => 1,
+                     );
+    // lookup if user is connected to a drupal account
+    $incoming['uid'] = twilio_lookup_user($incoming['phone']);
+
+    // Send welcome response if never seen before
+    if (is_null($incoming['uid'])) {
+      // insert phone number as uid = 0;
+      db_query("INSERT INTO twilio_user_phone (uid, phone) VALUES ('0', '%d')", $incoming['phone']);
+      $incoming['uid'] = 0;
+      $responses[] = array('uid' => $incoming['uid'],
+                           'text' => variable_get('twilio_welcome_text', ''),
+                           'phone' => $incoming['phone'],
+                           'incoming' => 0);
+    }
+    twilio_log_message($incoming);
+
+    // Determine incoming text
+    if (strtolower($incoming['text']) == 'help') {
+      // HELP Response
+      $responses[] = array('uid' => $incoming['uid'],
+                           'text' => variable_get('twilio_help_text', ''),
+                           'phone' => $incoming['phone'],
+                           'incoming' => 0);
+    }
+    else if (strtolower($incoming['text']) == 'stop') {
+      // Stop Response and remove phone from record
+      $responses[] = array('uid' => $incoming['uid'],
+                           'text' => variable_get('twilio_stop_text', ''),
+                           'phone' => $incoming['phone'],
+                           'incoming' => 0);
+      db_query("DELETE FROM twilio_user_phone WHERE phone = '%d'", $incoming['phone']);
+    }
+    else {
+      // Try other modules
+      foreach (module_invoke_all('twilio_respond', $incoming) as $hook_response) {
+        $responses[] = $hook_response;
+      }
+    }
+
+    // Send responses with the API
+    foreach ($responses as $response) {
+      twilio_send_message($response['phone'], $response['text']);
+    }
+  }
+
+}
+
+function twilio_log_message($message) {
+  $ts = time();
+  db_query("INSERT INTO twilio_log (uid, phone, message, incoming, timestamp) " .
+           "VALUES ('%d', '%d', '%s', '%d', '%d')",
+           $message['uid'], $message['phone'], $message['text'],
+           ($message['incoming'] == 0 ? 0 : 1), $ts);
+}
+
+function twilio_lookup_user($phone) {
+  $user = db_fetch_object(db_query("SELECT uid FROM twilio_user_phone WHERE phone = '%d'", $phone));
+  return $user->uid;
+}
+
+function twilio_test_invoke($foo = '') {
+  $response = module_invoke_all('twilio_respond', array('text' => $foo));
+  dpm($response);
+  return '<h1>Twilio Test Invoke</h1>';
+}

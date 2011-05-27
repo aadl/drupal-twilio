@@ -1,0 +1,6 @@
+; $Id$
+name = Twilio
+version = 6.x-1.0-dev
+description = Enable Twilio SMS interactions
+core = 6.x
+package = "AADL Modules"
